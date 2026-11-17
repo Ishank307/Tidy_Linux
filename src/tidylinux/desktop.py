@@ -17,11 +17,20 @@ def exec_argument(value: str) -> str:
     return desktop_string('"' + quoted + '"')
 
 
+def desktop_exec(executable: str) -> str:
+    # GIO checks argv[0] for existence before expanding %% to %. With a
+    # literal percent in the executable path, use Fedora's env as argv[0]
+    # so expansion happens on the application argument before it is run.
+    # env executes the absolute application path without a shell.
+    prefix = "/usr/bin/env " if "%" in executable else ""
+    return prefix + exec_argument(executable)
+
+
 def desktop_content(record: AppRecord) -> str:
     executable = str(Path(record.install_dir) / record.executable)
     # Working beside the launcher preserves bundles' relative resources.
     lines = ["[Desktop Entry]", "Type=Application", "Version=1.0",
-             f"Name={desktop_string(record.name)}", f"Exec={exec_argument(executable)}",
+             f"Name={desktop_string(record.name)}", f"Exec={desktop_exec(executable)}",
              f"Path={desktop_string(str(Path(executable).parent))}", "Terminal=false",
              "Categories=Utility;", "StartupNotify=false", f"X-TidyLinux-ID={record.app_id}"]
     lines.append("Icon=" + desktop_string(record.icon or "application-x-executable"))

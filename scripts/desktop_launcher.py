@@ -6,7 +6,7 @@ import sys
 
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / "src"))
-from tidylinux.desktop import desktop_string, exec_argument
+from tidylinux.desktop import desktop_exec, desktop_string, exec_argument
 from tidylinux.registry import Paths
 from tidylinux.models import TidyError
 
@@ -20,7 +20,7 @@ def main():
     icon = PROJECT / "data/icons/io.github.tidylinux.TidyLinux.svg"
     content = ("[Desktop Entry]\nType=Application\nVersion=1.0\nName=TidyLinux\n"
                "Comment=Install clean. Stay organized.\n"
-               f"Exec={exec_argument(sys.executable)} {exec_argument(str(PROJECT / 'scripts/run.py'))}\n"
+               f"Exec={desktop_exec(sys.executable)} {exec_argument(str(PROJECT / 'scripts/run.py'))}\n"
                f"Icon={desktop_string(str(icon))}\nTerminal=false\nCategories=System;Utility;\n"
                "StartupNotify=true\nX-TidyLinux-Launcher=1\n")
     try:

@@ -15,7 +15,10 @@ from .archive import Limits, check_cancel, extract_archive, icon_priority, inspe
 from .appimage import install_icon
 from .desktop import desktop_content, digest, verify_desktop
 from .models import AppRecord, Inspection, TidyError
+from .launchers import helper_reason
 from .registry import Paths, Registry
+from .transactions import (move, replace_installation, require_recovered, seal,
+                           validate_version)
 
 
 def fsync_file(path: Path, content: bytes):
@@ -46,7 +49,10 @@ class Installer:
             raise TidyError("Enter a name (up to 200 characters) and a valid optional version.")
         if executable not in {c.path for c in inspection.candidates}:
             raise TidyError("Select an executable from the inspected archive.")
+        if reason := helper_reason(executable):
+            raise TidyError(reason)
         with self.paths.locked():
+            require_recovered(self.paths)
             app_id = "tidylinux-" + uuid.uuid4().hex
             final = self.paths.apps / app_id
             desktop = self.paths.desktops / f"{app_id}.desktop"
@@ -57,51 +63,9 @@ class Installer:
                 published = False
                 desktop_published = False
                 try:
-                    snapshot = staging / "archive"
-                    checksum = hashlib.sha256()
-                    copied = 0
-                    with inspection.source.open("rb") as source, snapshot.open("xb") as output:
-                        while chunk := source.read(1024 * 1024):
-                            check_cancel(cancel)
-                            copied += len(chunk)
-                            if copied > self.limits.archive_bytes:
-                                raise TidyError("Archive exceeds the compressed size limit.")
-                            checksum.update(chunk)
-                            output.write(chunk)
-                    if checksum.hexdigest() != inspection.checksum:
-                        raise TidyError("Archive changed since inspection. Please select it again.")
-                    reviewed = inspect_archive(snapshot, self.limits, cancel)
-                    # Avoid installing different contents after a source change.
-                    if (reviewed.archive_size, reviewed.expanded_size, reviewed.candidates, reviewed.entries, reviewed.format) != (
-                            inspection.archive_size, inspection.expanded_size, inspection.candidates, inspection.entries, inspection.format):
-                        raise TidyError("Archive changed since inspection. Please select it again.")
+                    record = self._stage(inspection, executable, name, version, staging, app_id, cancel)
                     bundle = staging / "bundle"
-                    bundle.mkdir(mode=0o700)
-                    payload = bundle / "payload"
-                    payload.mkdir(mode=0o700)
-                    extract_archive(snapshot, payload, self.limits, cancel)
-                    launcher = payload / executable
-                    if not launcher.is_file() or launcher.is_symlink():
-                        raise TidyError("Selected executable is missing.")
-                    launcher.chmod(0o700)
-                    icon_path = min(reviewed.icons, key=lambda p: icon_priority(p, executable)) if reviewed.icons else None
-                    installed_size = reviewed.expanded_size
-                    if reviewed.format == "appimage":
-                        icon_path = install_icon(snapshot, payload, cancel)
-                        if icon_path:
-                            installed_size += (payload / icon_path).stat().st_size
-                            if installed_size > self.limits.expanded_bytes:
-                                raise TidyError("AppImage and icon exceed the installation size limit.")
-                    icon = str(final / "payload" / icon_path) if icon_path else None
-                    record = AppRecord(app_id, name, version, str(final / "payload"), executable, icon,
-                                       str(inspection.source), copied, checksum.hexdigest(),
-                                       datetime.now(timezone.utc).isoformat(), str(desktop), "", installed_size)
-                    content = desktop_content(record).encode("utf-8")
-                    record = replace(record, desktop_checksum=digest(content))
-                    fsync_file(bundle / "manifest.json", (json.dumps(record.to_dict(), indent=2) + "\n").encode())
                     desktop_stage = staging / "launcher.desktop"
-                    fsync_file(desktop_stage, content)
-                    sync_directory(bundle)
                     check_cancel(cancel)
                     # rename is atomic; exclusive desktop hard link cannot overwrite a file.
                     bundle.rename(final)
@@ -118,8 +82,103 @@ class Installer:
                         shutil.rmtree(final)
                     raise
 
+    def _stage(self, inspection: Inspection, executable: str, name: str, version: str,
+               staging: Path, app_id: str, cancel: Event | None) -> AppRecord:
+        final = self.paths.apps / app_id
+        desktop = self.paths.desktops / f"{app_id}.desktop"
+        snapshot = staging / "archive"
+        checksum = hashlib.sha256()
+        copied = 0
+        with inspection.source.open("rb") as source, snapshot.open("xb") as output:
+            while chunk := source.read(1024 * 1024):
+                check_cancel(cancel)
+                copied += len(chunk)
+                if copied > self.limits.archive_bytes:
+                    raise TidyError("Archive exceeds the compressed size limit.")
+                checksum.update(chunk)
+                output.write(chunk)
+        if checksum.hexdigest() != inspection.checksum:
+            raise TidyError("Archive changed since inspection. Please select it again.")
+        reviewed = inspect_archive(snapshot, self.limits, cancel)
+        # Avoid installing different contents after a source change.
+        if (reviewed.archive_size, reviewed.expanded_size, reviewed.candidates, reviewed.entries, reviewed.format) != (
+                inspection.archive_size, inspection.expanded_size, inspection.candidates, inspection.entries, inspection.format):
+            raise TidyError("Archive changed since inspection. Please select it again.")
+        bundle = staging / "bundle"
+        bundle.mkdir(mode=0o700)
+        payload = bundle / "payload"
+        payload.mkdir(mode=0o700)
+        extract_archive(snapshot, payload, self.limits, cancel)
+        launcher = payload / executable
+        if not launcher.is_file() or launcher.is_symlink():
+            raise TidyError("Selected executable is missing.")
+        launcher.chmod(0o700)
+        icon_path = min(reviewed.icons, key=lambda p: icon_priority(p, executable)) if reviewed.icons else None
+        installed_size = reviewed.expanded_size
+        if reviewed.format == "appimage":
+            icon_path = install_icon(snapshot, payload, cancel)
+            if icon_path:
+                installed_size += (payload / icon_path).stat().st_size
+                if installed_size > self.limits.expanded_bytes:
+                    raise TidyError("AppImage and icon exceed the installation size limit.")
+        icon = str(final / "payload" / icon_path) if icon_path else None
+        record = AppRecord(app_id, name, version, str(final / "payload"), executable, icon,
+                           str(inspection.source), copied, checksum.hexdigest(),
+                           datetime.now(timezone.utc).isoformat(), str(desktop), "", installed_size)
+        content = desktop_content(record).encode("utf-8")
+        record = replace(record, desktop_checksum=digest(content))
+        fsync_file(bundle / "manifest.json", (json.dumps(record.to_dict(), indent=2) + "\n").encode())
+        desktop_stage = staging / "launcher.desktop"
+        fsync_file(desktop_stage, content)
+        sync_directory(bundle)
+        return record
+
+    def _current(self, record: AppRecord) -> AppRecord:
+        require_recovered(self.paths)
+        current = self.registry.load(self.paths.apps / record.app_id)
+        if current != record:
+            raise TidyError("Application record changed. Refresh before modifying it.")
+        return current
+
+    def update(self, record: AppRecord, inspection: Inspection, executable: str,
+               version: str = "", cancel: Event | None = None) -> AppRecord:
+        version = version.strip()
+        if len(version) > 100 or any(ord(c) < 32 for c in version):
+            raise TidyError("Enter a valid optional version (up to 100 characters).")
+        if executable not in {candidate.path for candidate in inspection.candidates}:
+            raise TidyError("Select an executable from the inspected archive.")
+        if reason := helper_reason(executable):
+            raise TidyError(reason)
+        with self.paths.locked():
+            current = self._current(record)
+            def prepare(transaction: Path) -> AppRecord:
+                work = transaction / "work"
+                work.mkdir(mode=0o700)
+                replacement = self._stage(inspection, executable, current.name, version,
+                                          work, current.app_id, cancel)
+                seal(work / "bundle", replacement, (work / "launcher.desktop").read_bytes(), cancel)
+                move(work / "bundle", transaction / "new")
+                return replacement
+            return replace_installation(self.paths, current, prepare, cancel)
+
+    def rollback(self, record: AppRecord) -> AppRecord:
+        with self.paths.locked():
+            current = self._current(record)
+            backup = self.paths.rollback / current.app_id
+            previous = validate_version(self.paths, backup, current.app_id)
+            def prepare(transaction: Path) -> AppRecord:
+                # Keep the rollback source intact until the replacement commits.
+                work = transaction / "work"
+                work.mkdir(mode=0o700)
+                shutil.copytree(backup, work / "bundle")
+                seal(work / "bundle", previous, (backup / "desktop.backup").read_bytes())
+                move(work / "bundle", transaction / "new")
+                return previous
+            return replace_installation(self.paths, current, prepare)
+
     def launch(self, record: AppRecord) -> subprocess.Popen:
         with self.paths.locked():
+            require_recovered(self.paths)
             current = self.registry.load(self.paths.apps / record.app_id)
             executable = Path(current.install_dir) / current.executable
             try:
@@ -137,6 +196,7 @@ class Installer:
 
     def uninstall(self, record: AppRecord):
         with self.paths.locked():
+            require_recovered(self.paths)
             directory = self.paths.apps / record.app_id
             current = self.registry.load(directory)
             if current != record:
@@ -147,16 +207,26 @@ class Installer:
             if directory.is_symlink() or (directory / "payload").is_symlink():
                 raise TidyError("Managed directory has been replaced by a symbolic link.")
             desktop = Path(current.desktop_path)
+            backup = self.paths.rollback / current.app_id
+            has_backup = backup.exists() or backup.is_symlink()
+            if has_backup:
+                validate_version(self.paths, backup, current.app_id)
             # Invalidate registration atomically before deleting owned files.
             tombstone = Path(tempfile.mkdtemp(prefix="remove-", dir=self.paths.staging))
             try:
                 directory.rename(tombstone / "bundle")
                 try:
+                    if has_backup:
+                        backup.rename(tombstone / "rollback")
                     desktop.unlink(missing_ok=True)
                 except OSError:
                     (tombstone / "bundle").rename(directory)
+                    if (tombstone / "rollback").exists():
+                        (tombstone / "rollback").rename(backup)
                     raise
                 shutil.rmtree(tombstone / "bundle")
+                if has_backup:
+                    shutil.rmtree(tombstone / "rollback")
             finally:
                 if not any(tombstone.iterdir()):
                     tombstone.rmdir()

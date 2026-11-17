@@ -214,7 +214,7 @@ def executable_kind(name: str, header: bytes, mode: int) -> str | None:
     base = PurePosixPath(name).name.lower()
     if base in {"install", "setup", "uninstall", "install.sh", "setup.sh", "uninstall.sh", "configure"}:
         return None
-    if ".so" in base or base.endswith((".dll", ".exe", ".dylib")):
+    if base.endswith(".so") or ".so." in base or base.endswith((".dll", ".exe", ".dylib")):
         return None
     if header.startswith(b"\x7fELF"):
         return "Linux executable"

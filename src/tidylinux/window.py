@@ -4,11 +4,13 @@ from pathlib import Path
 from threading import Event
 import logging
 
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango
 
 from .archive import inspect_archive
+from . import __version__
 from .installer import Installer, trash_source
 from .models import Cancelled
+from .launchers import helper_reason, recommend_launcher
 
 LOG = logging.getLogger(__name__)
 
@@ -20,7 +22,7 @@ def margins(widget, amount=18):
 
 
 def label(text, css=None):
-    result = Gtk.Label(label=text, wrap=True, xalign=0)
+    result = Gtk.Label(label=text, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, xalign=0)
     if css:
         result.add_css_class(css)
     return result
@@ -82,8 +84,11 @@ class MainWindow(Adw.ApplicationWindow):
 
     def on_close(self, *_):
         if self.busy:
-            self.cancel.set()
-            self.toast("Cancelling the current operation. Close again when it finishes.")
+            if self.cancellable:
+                self.cancel.set()
+                self.toast("Cancelling the current operation. Close again when it finishes.")
+            else:
+                self.toast("Wait for the current operation to finish, then close again.")
             return True
         self.pool.shutdown(wait=False, cancel_futures=True)
         return False
@@ -102,6 +107,7 @@ class MainWindow(Adw.ApplicationWindow):
             self.toast("Wait for the current operation to finish.")
             return
         self.busy = True
+        self.cancellable = cancellable
         self.cancel = Event()
         self.install_button.set_sensitive(False)
         dialog = Adw.Dialog(title=title, content_width=340, can_close=False)
@@ -144,6 +150,8 @@ class MainWindow(Adw.ApplicationWindow):
         for record in records:
             row = Adw.ActionRow(title=GLib.markup_escape_text(record.name),
                                 subtitle=GLib.markup_escape_text(" · ".join(filter(None, (record.version, size_text(record.installed_size))))))
+            row.set_title_lines(2)
+            row.set_subtitle_lines(1)
             image = Gtk.Image(icon_name="application-x-executable-symbolic", pixel_size=32)
             if record.icon and Path(record.icon).is_file():
                 image.set_from_gicon(Gio.FileIcon.new(Gio.File.new_for_path(record.icon)))
@@ -155,7 +163,12 @@ class MainWindow(Adw.ApplicationWindow):
             row.add_suffix(launch)
             popover = Gtk.Popover()
             actions = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-            for text, callback in (("Details", self.details), ("Uninstall…", self.confirm_uninstall)):
+            menu_actions = [("Update…", self.choose_update)]
+            if record.app_id in self.installer.registry.rollback_ids:
+                menu_actions.append(("Roll Back…", self.confirm_rollback))
+            menu_actions.extend((("Launch", self.launch), ("Details", self.details),
+                                 ("Uninstall…", self.confirm_uninstall)))
+            for text, callback in menu_actions:
                 button = Gtk.Button(label=text)
                 button.add_css_class("flat")
                 button.connect("clicked", lambda _, cb=callback, r=record, p=popover: (p.popdown(), cb(r)))
@@ -172,10 +185,14 @@ class MainWindow(Adw.ApplicationWindow):
     def refresh(self):
         self.run_job(lambda: self.installer.registry.inventory(), self.show_inventory, "Refreshing applications…", False)
 
-    def choose_archive(self, *_):
+    def choose_update(self, record):
+        self.choose_archive(update_record=record)
+
+    def choose_archive(self, *_, update_record=None):
         if self.busy:
             return
-        chooser = Gtk.FileDialog(title="Choose an application archive or AppImage")
+        chooser = Gtk.FileDialog(title=(f"Choose replacement for {update_record.name}" if update_record
+                                        else "Choose an application archive or AppImage"))
         filter_ = Gtk.FileFilter(name="App archives and AppImages")
         for pattern in ("*.tar.gz", "*.tgz", "*.tar.xz", "*.zip", "*.[Aa][Pp][Pp][Ii][Mm][Aa][Gg][Ee]"):
             filter_.add_pattern(pattern)
@@ -187,7 +204,7 @@ class MainWindow(Adw.ApplicationWindow):
             try:
                 file = dialog.open_finish(result)
                 if file.get_path():
-                    self.inspect(Path(file.get_path()))
+                    self.inspect(Path(file.get_path()), update_record)
                 else:
                     self.message("Local file required", "Copy the application file to this computer first.")
             except GLib.Error as exc:
@@ -201,37 +218,67 @@ class MainWindow(Adw.ApplicationWindow):
         self.inspect(Path(file.get_path()))
         return True
 
-    def inspect(self, path):
-        self.run_job(lambda: inspect_archive(path, cancel=self.cancel), self.review, "Inspecting application…")
+    def inspect(self, path, update_record=None):
+        self.run_job(lambda: inspect_archive(path, cancel=self.cancel),
+                     lambda inspection: self.review(inspection, update_record), "Inspecting application…")
 
-    def review(self, inspection):
-        dialog = Adw.Dialog(title="Review installation", content_width=560, content_height=530)
+    def review(self, inspection, current=None):
+        dialog = Adw.Dialog(title="Replace installation" if current else "Review installation",
+                            content_width=560, content_height=530)
         toolbar = Adw.ToolbarView()
         toolbar.add_top_bar(Adw.HeaderBar())
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
         margins(content, 18)
         group = Adw.PreferencesGroup(title="Application")
-        name = Adw.EntryRow(title="Name", text=inspection.suggested_name)
-        version = Adw.EntryRow(title="Version (optional)")
+        name = Adw.EntryRow(title="Name", text=current.name if current else inspection.suggested_name)
+        name.set_editable(current is None)
+        version = Adw.EntryRow(title="New version (optional)" if current else "Version (optional)")
         group.add(name)
         group.add(version)
         content.append(group)
+        version_guidance = None
+        if current:
+            content.append(label(f"Current version: {current.version or 'Unknown'}"))
+            version_guidance = label("Version ordering cannot be verified when version information is missing.", "dim-label")
+            content.append(version_guidance)
+            content.append(label("Close this application before continuing. Its current managed files will be kept for rollback. "
+                                 "External settings and user data are preserved."))
         choice_offset = int(len(inspection.candidates) > 1)
+        recommended, reason = recommend_launcher(inspection)
         choices = (["Choose the main application launcher…"] if choice_offset else [])
-        executable = Gtk.DropDown.new_from_strings(choices + [c.path for c in inspection.candidates])
+        options = [c.path + (" — Recommended" if c.path == recommended else
+                            " — Helper" if helper_reason(c.path) else "") for c in inspection.candidates]
+        executable = Gtk.DropDown.new_from_strings(choices + options)
+        factory = Gtk.SignalListItemFactory()
+        def setup_choice(_, item):
+            item.set_child(Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.MIDDLE,
+                                     max_width_chars=40))
+        def bind_choice(_, item):
+            text = item.get_item().get_string()
+            item.get_child().set_text(text)
+            item.get_child().set_tooltip_text(text)
+        factory.connect("setup", setup_choice)
+        factory.connect("bind", bind_choice)
+        executable.set_factory(factory)
+        executable.set_list_factory(factory)
+        if recommended:
+            executable.set_selected(next(i for i, c in enumerate(inspection.candidates) if c.path == recommended) + choice_offset)
         executable.set_enable_search(True)
         executable.set_tooltip_text("Select the app launcher; bundles may also contain helper executables")
-        content.append(label("Executable", "heading"))
+        content.append(label("Application launcher", "heading"))
         content.append(executable)
-        if len(inspection.candidates) > 1:
-            content.append(label("Several executables were found. Choose the application's main launcher.", "dim-label"))
+        guidance = label(reason, "dim-label")
+        content.append(guidance)
         if inspection.format == "appimage":
             content.append(label("The AppImage will be copied and made executable. Its embedded logo is used when available. "
                                  "Running it may require FUSE support on your system.", "dim-label"))
         size_description = "installed" if inspection.format == "appimage" else "unpacked"
-        info = label(f"{inspection.source.name}\n{size_text(inspection.archive_size)} download · "
-                     f"{size_text(inspection.expanded_size)} {size_description}\n\n"
-                     f"Destination: {self.installer.paths.apps}/<unique app ID>/payload")
+        archive_label = str(inspection.source) if current else inspection.source.name
+        destination = str(self.installer.paths.apps / current.app_id / "payload") if current else f"{self.installer.paths.apps}/<unique app ID>/payload"
+        sizes = (f"{size_text(inspection.archive_size)} download\nEstimated installation size: {size_text(inspection.expanded_size)}"
+                 if current else f"{size_text(inspection.archive_size)} download · {size_text(inspection.expanded_size)} {size_description}")
+        info = label(f"{archive_label}\n{sizes}\n\n"
+                     f"Destination: {destination}")
         info.set_selectable(True)
         content.append(info)
         warning = label("Only install software you trust. Inspection does not establish safety. "
@@ -243,31 +290,49 @@ class MainWindow(Adw.ApplicationWindow):
         install = Gtk.Button(label="Install")
         install.add_css_class("suggested-action")
         def update_install(*_):
-            install.set_sensitive(bool(name.get_text().strip()) and
-                                  choice_offset <= executable.get_selected() < len(inspection.candidates) + choice_offset)
+            index = executable.get_selected() - choice_offset
+            valid = 0 <= index < len(inspection.candidates)
+            helper = helper_reason(inspection.candidates[index].path) if valid else None
+            guidance.set_text(helper or (reason if not valid or inspection.candidates[index].path == recommended else
+                                         "Custom launcher selected. Check that this is the file the publisher recommends to start the app."))
+            install.set_sensitive(bool(name.get_text().strip()) and valid and not helper)
+            if current:
+                known = bool(current.version and version.get_text().strip())
+                install.set_label("Update" if known else "Replace installation")
+                dialog.set_title("Review update" if known else "Replace installation")
+                version_guidance.set_text("Version labels are provided by you; ordering is not verified." if known else
+                                          "Version ordering cannot be verified when version information is missing.")
         name.connect("notify::text", update_install)
         executable.connect("notify::selected", update_install)
+        version.connect("notify::text", update_install)
         update_install()
         def confirmed(*_):
             chosen = inspection.candidates[executable.get_selected() - choice_offset].path
             app_name, app_version = name.get_text(), version.get_text()
             dialog.close()
-            self.run_job(lambda: self.installer.install(inspection, chosen, app_name, app_version, self.cancel),
-                         self.installed, "Installing application…")
+            if current:
+                self.run_job(lambda: self.installer.update(current, inspection, chosen, app_version, self.cancel),
+                             lambda record: self.installed(record, "updated"), "Replacing installation…")
+            else:
+                self.run_job(lambda: self.installer.install(inspection, chosen, app_name, app_version, self.cancel),
+                             self.installed, "Installing application…")
         install.connect("clicked", confirmed)
         buttons.append(cancel)
         buttons.append(install)
-        content.append(buttons)
+        toolbar.add_bottom_bar(margins(buttons, 12))
         toolbar.set_content(Gtk.ScrolledWindow(child=content, hscrollbar_policy=Gtk.PolicyType.NEVER))
         dialog.set_child(toolbar)
         dialog.present(self)
 
-    def installed(self, record):
-        self.toast(f"{record.name} installed")
-        dialog = Adw.Dialog(title="Application installed", content_width=400)
+    def installed(self, record, operation="installed"):
+        self.toast(f"{record.name} {operation}")
+        dialog = Adw.Dialog(title=f"Application {operation}", content_width=400)
         box = margins(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12), 24)
         box.append(label(f"{record.name} is ready", "title-2"))
-        box.append(label("The downloaded file has been preserved."))
+        box.append(label("Downloaded files are left untouched by rollback." if operation == "restored" else
+                         "The downloaded file has been preserved."))
+        if operation != "installed":
+            box.append(label("The previous installation is available from Roll Back."))
         launch = Gtk.Button(label="Launch Application")
         launch.add_css_class("suggested-action")
         launch.connect("clicked", lambda *_: (dialog.close(), self.launch(record)))
@@ -296,7 +361,7 @@ class MainWindow(Adw.ApplicationWindow):
 
     def confirm_uninstall(self, record):
         dialog = Adw.AlertDialog(heading=f"Uninstall {record.name}?",
-                                body="This removes the managed application and its shortcut. Settings and data outside the managed bundle are preserved.")
+                                body="This removes the managed application, its retained rollback version, and its shortcut. Settings and data outside the managed bundles are preserved.")
         dialog.add_response("cancel", "Cancel")
         dialog.add_response("uninstall", "Uninstall")
         dialog.set_response_appearance("uninstall", Adw.ResponseAppearance.DESTRUCTIVE)
@@ -308,6 +373,22 @@ class MainWindow(Adw.ApplicationWindow):
                              lambda _: (self.toast(f"{record.name} uninstalled"), self.refresh()),
                              "Removing application…", False)
         dialog.connect("response", response)
+        dialog.present(self)
+
+    def confirm_rollback(self, record):
+        previous = self.installer.registry.rollback_versions.get(record.app_id)
+        target = previous.version if previous and previous.version else "Unknown"
+        dialog = Adw.AlertDialog(heading=f"Roll back {record.name}?",
+                                body=f"Restore version: {target}\n\nClose the application first. "
+                                     "The current installation will become the rollback version. "
+                                     "External settings and user data are not reverted.")
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("rollback", "Roll Back")
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+        dialog.connect("response", lambda _, response: self.run_job(
+            lambda: self.installer.rollback(record), lambda restored: self.installed(restored, "restored"),
+            "Restoring previous installation…", False) if response == "rollback" else None)
         dialog.present(self)
 
     def confirm_trash(self, record):
@@ -324,5 +405,5 @@ class MainWindow(Adw.ApplicationWindow):
 
     def about(self, *_):
         Adw.AboutDialog(application_name="TidyLinux", application_icon="package-x-generic",
-                        version="1.0.0", developer_name="TidyLinux contributors",
+                        version=__version__, developer_name="TidyLinux contributors",
                         license_type=Gtk.License.GPL_3_0, comments="Install clean. Stay organized.").present(self)

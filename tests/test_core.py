@@ -13,11 +13,12 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import uuid
 import zipfile
 
 from tidylinux.archive import Limits, extract_archive, inspect_archive, safe_relative
-from tidylinux.desktop import desktop_content, digest, exec_argument
+from tidylinux.desktop import desktop_content, desktop_exec, digest, exec_argument
 from tidylinux.installer import Installer
 from tidylinux.models import Cancelled, TidyError
 from tidylinux.registry import Paths, Registry
@@ -110,7 +111,7 @@ class CoreTests(TestCase):
                     self.assertEqual(self.installer.registry.inventory(), ([record], []))
                     self.installer.launch(record)
                     self.assertEqual(spawn.call_args.args[0], [str(executable)])
-                    self.assertIn(f"Exec={exec_argument(str(executable))}", Path(record.desktop_path).read_text())
+                    self.assertIn(f"Exec={desktop_exec(str(executable))}", Path(record.desktop_path).read_text())
                 self.installer.uninstall(record)
                 self.assertFalse(Path(record.install_dir).exists())
                 self.assertFalse(Path(record.desktop_path).exists())
@@ -354,6 +355,8 @@ class CoreTests(TestCase):
         for content in ("{bad", "[]", json.dumps({**original, "install_dir": str(self.root)}),
                         json.dumps({**original, "executable": "../../outside"}),
                         json.dumps({**original, "source_size": "big"}),
+                        json.dumps({**original, "name": "x" * 201}),
+                        json.dumps({**original, "version": "x" * 101}),
                         json.dumps({**original, "icon": record.install_dir + "/../outside"})):
             with self.subTest(content=content):
                 path.write_text(content)
@@ -442,6 +445,8 @@ class CoreTests(TestCase):
             with self.assertRaisesRegex(TidyError, "progress"):
                 with self.paths.locked():
                     self.fail("second lock acquired")
+            with self.assertRaisesRegex(TidyError, "progress"):
+                self.installer.registry.inventory()
         isolated = Paths(self.root / "isolated")
         isolated.data.mkdir()
         isolated.root.symlink_to(self.paths.root)
@@ -550,6 +555,123 @@ class CoreTests(TestCase):
         record = self.installer.install(inspected, "Native App/run", "Native fixture")
         process = self.installer.launch(record)
         self.assertEqual(process.wait(timeout=5), 0)
+
+    def test_helper_selection_is_rejected_before_writing(self):
+        inspected = inspect_archive(self.archive([("bundle/code", SCRIPT, 0o755),
+                                                  ("bundle/chrome-sandbox", SCRIPT, 0o755)]))
+        with self.assertRaisesRegex(TidyError, "Helper program"):
+            self.installer.install(inspected, "bundle/chrome-sandbox", "App")
+        self.assertFalse(self.paths.root.exists())
+
+    def test_realistic_portable_bundle_lifecycle(self):
+        from tidylinux.launchers import recommend_launcher
+        launcher = b'#!/bin/sh\ncat resources/message.txt > launched.txt\n'
+        for kind in ("gz", "xz", "zip"):
+            with self.subTest(kind=kind):
+                source = self.archive([
+                    ("Demo-linux-x64/demo", launcher, 0o755),
+                    ("Demo-linux-x64/alternate.sh", launcher, 0o755),
+                    ("Demo-linux-x64/chrome-sandbox", SCRIPT, 0o755),
+                    ("Demo-linux-x64/resources/message.txt", b"fixture resource", 0o644),
+                    ("Demo-linux-x64/lib/runtime.so.1", b"\x7fELF", 0o755),
+                ], kind)
+                inspected = inspect_archive(source)
+                self.assertEqual(recommend_launcher(inspected)[0], "Demo-linux-x64/demo")
+                self.assertNotIn("Demo-linux-x64/lib/runtime.so.1", [c.path for c in inspected.candidates])
+                # Honor a valid explicit selection even when another is recommended.
+                record = self.installer.install(inspected, "Demo-linux-x64/alternate.sh", "Demo")
+                restarted = Installer(Paths(self.paths.data))
+                self.assertEqual(restarted.registry.inventory(), ([record], []))
+                environment = {**os.environ, "XDG_DATA_HOME": str(self.paths.data),
+                               "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
+                subprocess.run([sys.executable, "-c",
+                                "from tidylinux.registry import Paths, Registry; import sys; "
+                                "records, warnings = Registry(Paths.default()).inventory(); "
+                                "assert not warnings and [r.app_id for r in records] == [sys.argv[1]]",
+                                record.app_id], env=environment, check=True, capture_output=True)
+                self.assertIn(exec_argument(str(Path(record.install_dir) / record.executable)),
+                              Path(record.desktop_path).read_text())
+                self.assertEqual(restarted.launch(record).wait(timeout=5), 0)
+                self.assertEqual((Path(record.install_dir) / "Demo-linux-x64/launched.txt").read_bytes(), b"fixture resource")
+                unrelated = self.paths.desktops / "unrelated.desktop"
+                unrelated.write_text("keep")
+                restarted.uninstall(record)
+                self.assertEqual(unrelated.read_text(), "keep")
+                self.assertTrue(source.is_file())
+                self.assertFalse(Path(record.desktop_path).exists())
+                self.assertEqual(restarted.registry.inventory(), ([], []))
+                self.assertEqual(list(self.paths.staging.iterdir()), [])
+
+    def test_internal_links_still_rejected(self):
+        path = self.root / "portable-links.tar.gz"
+        with tarfile.open(path, "w:gz") as archive:
+            entry = tarfile.TarInfo("Demo/bin/demo")
+            entry.size, entry.mode = len(SCRIPT), 0o755
+            archive.addfile(entry, io.BytesIO(SCRIPT))
+            entry = tarfile.TarInfo("Demo/AppRun")
+            entry.type, entry.linkname = tarfile.SYMTYPE, "bin/demo"
+            archive.addfile(entry)
+        with self.assertRaisesRegex(TidyError, "links"):
+            inspect_archive(path)
+        self.assertTrue(path.exists())
+
+    def test_executable_name_containing_so_is_discovered(self):
+        inspected = inspect_archive(self.archive([("app/demo.something", b"\x7fELF", 0o755)]))
+        self.assertEqual(inspected.candidates[0].path, "app/demo.something")
+
+    def test_nonregular_manifest_rejected_without_reading(self):
+        record = self.install()
+        manifest = self.paths.apps / record.app_id / "manifest.json"
+        manifest.unlink()
+        os.mkfifo(manifest)
+        with self.assertRaisesRegex(TidyError, "invalid manifest file"):
+            self.installer.registry.load(manifest.parent)
+
+    def test_foreign_manifest_owner_rejected(self):
+        record = self.install()
+        with mock.patch("tidylinux.registry.os.getuid", return_value=os.getuid() + 1):
+            with self.assertRaisesRegex(TidyError, "invalid manifest file"):
+                self.installer.registry.load(self.paths.apps / record.app_id)
+
+    def test_staging_leftovers_are_reported_and_preserved(self):
+        self.paths.prepare()
+        leftover = self.paths.staging / "remove-interrupted"
+        leftover.mkdir()
+        (leftover / "user-data").write_text("keep")
+        records, warnings = self.installer.registry.inventory()
+        self.assertEqual(records, [])
+        self.assertTrue(any("Interrupted-operation" in warning for warning in warnings))
+        self.assertEqual((leftover / "user-data").read_text(), "keep")
+
+    def test_failed_manifest_write_rolls_back(self):
+        inspected = inspect_archive(self.archive())
+        with mock.patch("tidylinux.installer.fsync_file", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                self.installer.install(inspected, inspected.candidates[0].path, "Demo")
+        self.assertEqual(list(self.paths.apps.iterdir()), [])
+        self.assertEqual(list(self.paths.desktops.iterdir()), [])
+        self.assertEqual(list(self.paths.staging.iterdir()), [])
+
+    def test_desktop_launch_handles_quoted_paths(self):
+        try:
+            import gi
+            gi.require_version("GioUnix", "2.0")
+            from gi.repository import GioUnix
+        except (ImportError, ValueError):
+            self.skipTest("GioUnix unavailable; desktop launch needs Fedora's PyGObject")
+        for directory in ('plain', 'spaces % $ " `', 'backslash\\path'):
+            with self.subTest(directory=directory):
+                self.installer = Installer(Paths(self.root / directory))
+                record = self.install()
+                info = GioUnix.DesktopAppInfo.new_from_filename(record.desktop_path)
+                self.assertIsNotNone(info)
+                self.assertTrue(info.launch([], None))
+                result = Path(record.install_dir) / "My App/launched.txt"
+                deadline = time.monotonic() + 5
+                while (not result.exists() or result.read_text() != "ready") and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(result.read_text(), "ready")
+                self.installer.uninstall(record)
 
     def test_own_launcher_setup_remove_and_refuse_overwrite(self):
         import sys

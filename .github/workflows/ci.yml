@@ -28,9 +28,10 @@ jobs:
           desktop-file-validate data/io.github.tidylinux.TidyLinux.desktop
           appstreamcli validate --no-net data/io.github.tidylinux.TidyLinux.metainfo.xml
       - name: Native GUI smoke
-        run: dbus-run-session -- xvfb-run -a python3 scripts/smoke_gui.py
+        run: xvfb-run -a dbus-run-session -- python3 scripts/smoke_gui.py
         env:
           GSK_RENDERER: cairo
+          GDK_BACKEND: x11
       - name: Build and verify RPM
         run: bash scripts/build_rpm.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

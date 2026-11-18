@@ -167,12 +167,20 @@ def main():
         # Both color schemes and a compact window must allocate the review.
         style = Adw.StyleManager.get_default()
         window.set_default_size(480, 360)
+        # X11 configure events are asynchronous, and client-side decorations
+        # can consume part of the requested size (470x350 content for 480x360).
+        # Require compact content before the modal review measures itself.
+        try:
+            pump_until(lambda: 0 < window.get_width() <= 480 and 0 < window.get_height() <= 360)
+        except AssertionError as exc:
+            raise AssertionError(f"Compact resize failed: requested 480x360, got "
+                                 f"{window.get_width()}x{window.get_height()}") from exc
         long_path = "Sample App/" + "long-directory/" * 12 + "launcher"
         window.review(replace(inspection, source=root / ("long-name-" * 20 + ".tar.gz"),
                               candidates=(Candidate(long_path, "Linux executable"),)))
         review = window.get_visible_dialog()
         pump_until(lambda: review.get_width() > 0)
-        assert window.get_width() == 480
+        assert 0 < window.get_width() <= 480
         selector = next(w for w in descendants(review) if isinstance(w, Gtk.DropDown))
         assert selector.get_width() <= review.get_width() <= window.get_width()
         capture("review-long-path.png")
@@ -333,7 +341,7 @@ def main():
         for scheme in (Adw.ColorScheme.FORCE_LIGHT, Adw.ColorScheme.FORCE_DARK):
             style.set_color_scheme(scheme)
             pump_until(lambda: dialog.get_width() > 0)
-            assert window.get_width() == 480 and dialog.get_width() <= 480
+            assert 0 < window.get_width() <= 480 and dialog.get_width() <= window.get_width()
             def download_button_visible():
                 success, bounds = download_button.compute_bounds(dialog)
                 return (success and download_button.get_height() > 0 and bounds.get_y() >= 0
@@ -376,7 +384,8 @@ def main():
         pump_until(lambda: not window.busy)
         if "--screenshots" in sys.argv:
             window.set_default_size(760, 540)
-            pump_until(lambda: window.get_width() >= 760)
+            # Wait for the enlargement without assuming decoration dimensions.
+            pump_until(lambda: window.get_width() > 480)
         capture("updates-list.png")
         # Real Cleanup widgets and scan, using only disposable fixture downloads.
         from tidylinux.cleanup_ui import present_cleanup

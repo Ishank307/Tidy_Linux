@@ -1,0 +1,13 @@
+# Smart Cleanup (development)
+
+The main menu now offers Cleanup. Opening it performs no scan. Choose a location and press Scan to review installer files directly in that directory. Downloads is an optional default; scanning is nonrecursive and limited to 10,000 entries. No networking, scheduling, automatic selection, or permanent deletion is used. At V1.3 implementation, the version remained 1.2.0 pending acceptance; V1.4 packaging advances it separately.
+
+Candidates include full SHA-256 duplicate installers, checksum-matched current/rollback source archives, and validated manager-owned temporary downloads without pending transactions. Duplicate groups designate a retained copy which is not selectable. Its hash must still match before each other copy is moved. Tracked archives are unverified as to necessity. Matching names alone never identify duplicates.
+
+Inspect Folder allows explicit, bounded inspection of a folder (12 levels, 10,000 entries), with size and entry count. It is unverified and needs an additional confirmation. No automatic extracted-folder heuristics are used. Symlinks, other owners, filesystem crossings, managed storage, and overlapping active installations are rejected.
+
+All inspection and Trash work runs on the existing worker, with cancellation. Cleanup holds the existing manager lock. Paths, metadata, hashes, temporary markers, and pending transactions are rechecked before native Gio Trash. Changed items and unavailable Trash are reported and preserved. No fallback deletion exists. Moving to Trash does not guarantee reclaimed disk space.
+
+Staging contents with ambiguous provenance are reported and preserved. Cleanup does not invoke recovery or guess that a staging tree is disposable. Existing startup recovery is unchanged. Folder inspection hashes contents and may be slow for large folders. Filesystem rename races cannot be eliminated by Gio's path-based Trash API; checks are conservative but do not promise atomic protection from hostile concurrent filesystem writers. Close other tools modifying selected files during cleanup.
+
+Manual acceptance: open Cleanup and verify no scan starts; scan a disposable directory containing duplicate and distinct fixture archives; verify the retained copy, unchecked results, sizes and reasons. Cancel a large scan. Change a candidate or retained copy and confirm cleanup skips it. Review an unverified folder and cancel each confirmation. Test native Trash success and failure, light/dark themes, compact windows, keyboard and screen-reader navigation. Never use real installations for destructive acceptance tests.

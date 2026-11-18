@@ -47,16 +47,25 @@ class Paths:
     def transactions(self):
         return self.root / "transactions"
 
+    @property
+    def sources(self):
+        return self.root / "sources"
+
+    @property
+    def downloads(self):
+        return self.root / "downloads"
+
     def prepare(self):
         if not self.data.is_absolute():
             raise TidyError("XDG data directory must be absolute.")
-        for path in (self.root, self.apps, self.staging, self.desktops, self.rollback, self.transactions):
+        for path in (self.root, self.apps, self.staging, self.desktops, self.rollback, self.transactions,
+                     self.sources, self.downloads):
             if path.is_symlink():
                 raise TidyError(f"Managed directory is a symbolic link: {path}")
             path.mkdir(parents=True, exist_ok=True, mode=0o700)
             if not path.is_dir() or path.stat().st_uid != os.getuid():
                 raise TidyError(f"Managed directory is not owned by this user: {path}")
-        for path in (self.root, self.apps, self.staging, self.rollback, self.transactions):
+        for path in (self.root, self.apps, self.staging, self.rollback, self.transactions, self.sources, self.downloads):
             if stat.S_IMODE(path.stat().st_mode) & 0o077:
                 raise TidyError(f"Managed directory must be private (mode 0700): {path}")
 
@@ -79,6 +88,7 @@ class Registry:
         self.paths = paths
         self.rollback_ids: set[str] = set()
         self.rollback_versions: dict[str, AppRecord] = {}
+        self.update_sources: dict[str, str] = {}
 
     def load(self, directory: Path, *, app_id: str | None = None) -> AppRecord:
         try:
@@ -139,6 +149,10 @@ class Registry:
         records, warnings = [], recover_transactions(self.paths)
         self.rollback_ids = set()
         self.rollback_versions = {}
+        self.update_sources = {}
+        if any(self.paths.downloads.iterdir()):
+            warnings.append(f"Temporary update downloads remain in {self.paths.downloads}. "
+                            "They were preserved; no network request or installation was started.")
         # Inspect under the mutation lock so an active operation is not reported
         # as crash debris. Never delete interrupted-operation data automatically.
         if any(self.paths.staging.iterdir()):
@@ -151,6 +165,16 @@ class Registry:
             try:
                 record = self.load(directory)
                 records.append(record)
+                from .sources import SourceStore
+                try:
+                    pending = self.paths.sources / f"{record.app_id}.json.pending"
+                    if pending.exists() or pending.is_symlink():
+                        warnings.append(f"{record.name}: interrupted source metadata remains at {pending}; it was preserved.")
+                    source = SourceStore(self.paths).read(record)
+                    if source:
+                        self.update_sources[record.app_id] = source
+                except (OSError, ValueError, TidyError) as exc:
+                    warnings.append(f"{record.name}: update source unavailable: {exc}")
                 if any((directory / name).exists() or (directory / name).is_symlink()
                        for name in ("desktop.backup.pending", "rollback.json.pending")):
                     warnings.append(f"{record.name}: interrupted backup metadata remains in {directory}; "

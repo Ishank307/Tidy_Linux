@@ -1,7 +1,7 @@
 """Small native interface. Blocking filesystem work stays on one worker thread."""
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 import logging
 
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango
@@ -11,6 +11,8 @@ from . import __version__
 from .installer import Installer, trash_source
 from .models import Cancelled
 from .launchers import helper_reason, recommend_launcher
+from .updates import install_download
+from .update_ui import OnlineUpdates
 
 LOG = logging.getLogger(__name__)
 
@@ -39,6 +41,11 @@ class MainWindow(Adw.ApplicationWindow):
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tidylinux")
         self.busy = False
         self.cancel = Event()
+        self.closing = False
+        self.records = []
+        self.inventory_warnings = []
+        self.update_results = {}
+        self.online = OnlineUpdates(self)
         self.connect("close-request", self.on_close)
         self.overlay = Adw.ToastOverlay()
         self.set_content(self.overlay)
@@ -52,13 +59,22 @@ class MainWindow(Adw.ApplicationWindow):
         self.install_button.connect("clicked", self.choose_archive)
         header.pack_start(self.install_button)
         menu = Gio.Menu()
+        menu.append("Cleanup…", "win.cleanup")
         menu.append("About TidyLinux", "win.about")
         header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu, tooltip_text="Main menu"))
-        for name, callback in (("install", self.choose_archive), ("about", self.about)):
+        from .cleanup_ui import present_cleanup
+        for name, callback in (("check-updates", self.online.check), ("cleanup", lambda *_: present_cleanup(self)), ("install", self.choose_archive), ("about", self.about)):
             action = Gio.SimpleAction.new(name, None)
             action.connect("activate", callback)
             self.add_action(action)
         layout.append(header)
+        checks = Gtk.Box(halign=Gtk.Align.END)
+        checks.set_margin_end(12)
+        checks.set_margin_bottom(6)
+        self.check_button = Gtk.Button(label="Check for Updates", tooltip_text="Manually check linked GitHub release sources")
+        self.check_button.connect("clicked", self.online.check)
+        checks.append(self.check_button)
+        layout.append(checks)
         self.banner = Adw.Banner(title="", button_label="Details", revealed=False)
         self.banner.connect("button-clicked", lambda *_: self.message("Inventory needs attention", self.inventory_warning))
         layout.append(self.banner)
@@ -91,6 +107,7 @@ class MainWindow(Adw.ApplicationWindow):
                 self.toast("Wait for the current operation to finish, then close again.")
             return True
         self.pool.shutdown(wait=False, cancel_futures=True)
+        self.closing = True
         return False
 
     def toast(self, text):
@@ -102,7 +119,7 @@ class MainWindow(Adw.ApplicationWindow):
         dialog.set_default_response("close")
         dialog.present(self)
 
-    def run_job(self, work, done, title, cancellable=True):
+    def run_job(self, work, done, title, cancellable=True, *, progress=False, on_failure=None):
         if self.busy:
             self.toast("Wait for the current operation to finish.")
             return
@@ -110,11 +127,34 @@ class MainWindow(Adw.ApplicationWindow):
         self.cancellable = cancellable
         self.cancel = Event()
         self.install_button.set_sensitive(False)
+        self.check_button.set_sensitive(False)
         dialog = Adw.Dialog(title=title, content_width=340, can_close=False)
         box = margins(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18), 24)
         box.append(label(title, "title-3"))
         spinner = Gtk.Spinner(spinning=True, halign=Gtk.Align.CENTER)
         box.append(spinner)
+        if progress:
+            status = label(title)
+            bar = Gtk.ProgressBar()
+            box.append(status)
+            box.append(bar)
+            token, lock = self.cancel, Lock()
+            updates = {"pending": False, "latest": (title, 0)}
+            def apply_progress():
+                with lock:
+                    text, fraction = updates["latest"]
+                    updates["pending"] = False
+                if self.busy and self.cancel is token:
+                    status.set_text(text)
+                    bar.set_fraction(max(0, min(1, fraction)))
+                return GLib.SOURCE_REMOVE
+            def report_progress(text, fraction):
+                with lock:
+                    updates["latest"] = text, fraction
+                    if not updates["pending"]:
+                        updates["pending"] = True
+                        GLib.idle_add(apply_progress)
+            self.report_progress = report_progress
         if cancellable:
             button = Gtk.Button(label="Cancel")
             button.connect("clicked", lambda *_: (self.cancel.set(), button.set_sensitive(False)))
@@ -127,11 +167,16 @@ class MainWindow(Adw.ApplicationWindow):
             dialog.force_close()
             self.busy = False
             self.install_button.set_sensitive(True)
+            self.check_button.set_sensitive(bool(self.records))
             try:
                 result = future.result()
-            except Cancelled:
+            except Cancelled as exc:
+                if on_failure:
+                    on_failure(exc)
                 self.toast("Operation cancelled")
             except Exception as exc:
+                if on_failure:
+                    on_failure(exc)
                 LOG.exception("Operation failed")
                 self.message("Could not complete operation", str(exc))
             else:
@@ -145,17 +190,30 @@ class MainWindow(Adw.ApplicationWindow):
 
     def show_inventory(self, result):
         records, warnings = result
+        self.records, self.inventory_warnings = records, warnings
+        self.check_button.set_sensitive(bool(records) and not self.busy)
         while child := self.rows.get_first_child():
             self.rows.remove(child)
         for record in records:
+            result = self.update_results.get(record.app_id)
+            if result and (result.record != record or (result.release and
+                    result.release.repository != self.installer.registry.update_sources.get(record.app_id))):
+                self.update_results.pop(record.app_id, None)
+                result = None
+            status = result.status if result else ("Version unknown" if record.app_id in self.installer.registry.update_sources else "Not configured")
             row = Adw.ActionRow(title=GLib.markup_escape_text(record.name),
-                                subtitle=GLib.markup_escape_text(" · ".join(filter(None, (record.version, size_text(record.installed_size))))))
+                                subtitle=GLib.markup_escape_text(" · ".join(filter(None, (status, record.version, size_text(record.installed_size))))))
+            row.set_tooltip_text(result.detail if result else "No release check has been made. Use Check for Updates or configure Update Source.")
             row.set_title_lines(2)
             row.set_subtitle_lines(1)
             image = Gtk.Image(icon_name="application-x-executable-symbolic", pixel_size=32)
             if record.icon and Path(record.icon).is_file():
                 image.set_from_gicon(Gio.FileIcon.new(Gio.File.new_for_path(record.icon)))
             row.add_prefix(image)
+            if result and result.status in {"Update available", "Version unknown"} and result.release and result.release.assets:
+                review_release = Gtk.Button(label="Review release…", valign=Gtk.Align.CENTER)
+                review_release.connect("clicked", lambda _, r=result: self.online.review_release(r))
+                row.add_suffix(review_release)
             launch = Gtk.Button(icon_name="media-playback-start-symbolic", valign=Gtk.Align.CENTER,
                                 tooltip_text=f"Launch {record.name}")
             launch.add_css_class("flat")
@@ -163,7 +221,7 @@ class MainWindow(Adw.ApplicationWindow):
             row.add_suffix(launch)
             popover = Gtk.Popover()
             actions = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-            menu_actions = [("Update…", self.choose_update)]
+            menu_actions = [("Update…", self.choose_update), ("Update Source…", self.online.configure)]
             if record.app_id in self.installer.registry.rollback_ids:
                 menu_actions.append(("Roll Back…", self.confirm_rollback))
             menu_actions.extend((("Launch", self.launch), ("Details", self.details),
@@ -222,7 +280,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.run_job(lambda: inspect_archive(path, cancel=self.cancel),
                      lambda inspection: self.review(inspection, update_record), "Inspecting application…")
 
-    def review(self, inspection, current=None):
+    def review(self, inspection, current=None, *, version_label="", downloaded=None):
         dialog = Adw.Dialog(title="Replace installation" if current else "Review installation",
                             content_width=560, content_height=530)
         toolbar = Adw.ToolbarView()
@@ -232,7 +290,7 @@ class MainWindow(Adw.ApplicationWindow):
         group = Adw.PreferencesGroup(title="Application")
         name = Adw.EntryRow(title="Name", text=current.name if current else inspection.suggested_name)
         name.set_editable(current is None)
-        version = Adw.EntryRow(title="New version (optional)" if current else "Version (optional)")
+        version = Adw.EntryRow(title="New version (optional)" if current else "Version (optional)", text=version_label)
         group.add(name)
         group.add(version)
         content.append(group)
@@ -289,6 +347,9 @@ class MainWindow(Adw.ApplicationWindow):
         cancel.connect("clicked", lambda *_: dialog.close())
         install = Gtk.Button(label="Install")
         install.add_css_class("suggested-action")
+        accepted = False
+        if downloaded:
+            dialog.connect("closed", lambda *_: self.online.discard(downloaded) if not accepted else None)
         def update_install(*_):
             index = executable.get_selected() - choice_offset
             valid = 0 <= index < len(inspection.candidates)
@@ -307,12 +368,16 @@ class MainWindow(Adw.ApplicationWindow):
         version.connect("notify::text", update_install)
         update_install()
         def confirmed(*_):
+            nonlocal accepted
             chosen = inspection.candidates[executable.get_selected() - choice_offset].path
             app_name, app_version = name.get_text(), version.get_text()
+            accepted = True
             dialog.close()
             if current:
-                self.run_job(lambda: self.installer.update(current, inspection, chosen, app_version, self.cancel),
-                             lambda record: self.installed(record, "updated"), "Replacing installation…")
+                self.run_job(lambda: install_download(self.installer, current, downloaded, chosen, app_version,
+                             approved=True, cancel=self.cancel) if downloaded else
+                             self.installer.update(current, inspection, chosen, app_version, self.cancel),
+                             lambda record: self.installed(record, "updated", managed_download=downloaded is not None), "Replacing installation…")
             else:
                 self.run_job(lambda: self.installer.install(inspection, chosen, app_name, app_version, self.cancel),
                              self.installed, "Installing application…")
@@ -324,12 +389,13 @@ class MainWindow(Adw.ApplicationWindow):
         dialog.set_child(toolbar)
         dialog.present(self)
 
-    def installed(self, record, operation="installed"):
+    def installed(self, record, operation="installed", *, managed_download=False):
         self.toast(f"{record.name} {operation}")
         dialog = Adw.Dialog(title=f"Application {operation}", content_width=400)
         box = margins(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12), 24)
         box.append(label(f"{record.name} is ready", "title-2"))
-        box.append(label("Downloaded files are left untouched by rollback." if operation == "restored" else
+        box.append(label("The manager-owned download is cleaned after success or retained for recovery." if managed_download else
+                         "Downloaded files are left untouched by rollback." if operation == "restored" else
                          "The downloaded file has been preserved."))
         if operation != "installed":
             box.append(label("The previous installation is available from Roll Back."))
@@ -340,7 +406,8 @@ class MainWindow(Adw.ApplicationWindow):
         trash.connect("clicked", lambda *_: (dialog.close(), self.confirm_trash(record)))
         done = Gtk.Button(label="Done")
         done.connect("clicked", lambda *_: dialog.close())
-        for button in (launch, trash, done):
+        source_is_managed = Path(record.source).is_relative_to(self.installer.paths.downloads)
+        for button in ((launch, done) if managed_download or source_is_managed else (launch, trash, done)):
             box.append(button)
         dialog.set_child(box)
         def refreshed(result):
@@ -353,10 +420,14 @@ class MainWindow(Adw.ApplicationWindow):
                      "Launching application…", False)
 
     def details(self, record):
+        result = self.update_results.get(record.app_id)
+        source = self.installer.registry.update_sources.get(record.app_id, "Not configured")
         self.message(record.name, f"Version: {record.version or 'Unknown'}\n"
                      f"Installed: {record.installed_at}\nSize: {size_text(record.installed_size)}\n\n"
                      f"Location: {record.install_dir}\nExecutable: {record.executable}\n\n"
                      f"Original file: {record.source}\nSHA-256: {record.checksum}\n\n"
+                     f"Update source: {source}\nUpdate status: {result.status if result else 'Not checked'}\n"
+                     f"{result.detail if result else 'Use Check for Updates to request a check.'}\n\n"
                      "Uninstall preserves application settings and user data outside the managed bundle.")
 
     def confirm_uninstall(self, record):
@@ -404,6 +475,6 @@ class MainWindow(Adw.ApplicationWindow):
         dialog.present(self)
 
     def about(self, *_):
-        Adw.AboutDialog(application_name="TidyLinux", application_icon="package-x-generic",
-                        version=__version__, developer_name="TidyLinux contributors",
-                        license_type=Gtk.License.GPL_3_0, comments="Install clean. Stay organized.").present(self)
+        Adw.AboutDialog(application_name="TidyLinux", application_icon="io.github.tidylinux.TidyLinux",
+                        version=__version__, website="https://github.com/Ishank307/Tidy_Linux",
+                        license_type=Gtk.License.GPL_3_0, comments="Manage portable applications and installation leftovers.\nInstall clean. Stay organized.").present(self)

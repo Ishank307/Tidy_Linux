@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.tidylinux.TidyLinux</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>TidyLinux</name>
+  <summary>Manage portable applications and installation leftovers</summary>
+  <description><p>TidyLinux installs portable Linux archives and AppImages in user-owned storage. Review local updates, roll back installations, explicitly check linked GitHub releases, and review installation leftovers before moving them to Trash.</p></description>
+  <url type="homepage">https://github.com/Ishank307/Tidy_Linux</url>
+  <url type="bugtracker">https://github.com/Ishank307/Tidy_Linux/issues</url>
+  <launchable type="desktop-id">io.github.tidylinux.TidyLinux.desktop</launchable>
+  <provides><binary>tidylinux</binary></provides>
+  <content_rating type="oars-1.1"/>
+  <releases><release version="1.4.0" date="2026-11-18" type="development"/></releases>
+</component>

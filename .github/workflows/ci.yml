@@ -11,9 +11,11 @@ jobs:
     runs-on: ubuntu-latest
     container: fedora:45
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Install build and test dependencies
         run: dnf install -y rpm-build python3-devel pyproject-rpm-macros python3-setuptools python3-wheel python3-pytest python3-gobject gtk4 libadwaita desktop-file-utils appstream xorg-x11-server-Xvfb xorg-x11-xauth dbus-daemon git
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Verify Git checkout
+        run: git rev-parse --is-inside-work-tree
       - name: Tests and static checks
         run: |
           PYTHONPATH=src python3 -m pytest -q

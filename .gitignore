@@ -5,3 +5,13 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+.rpmbuild/
+*.rpm
+*.src.rpm
+*.tar.gz
+*.tar.xz
+*.zip
+*.log
+*.swp
+*~
+.local-state/

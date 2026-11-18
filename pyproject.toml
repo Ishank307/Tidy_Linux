@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tidylinux"
-version = "1.1.0"
+dynamic = ["version"]
 description = "Install clean. Stay organized. A native manager for portable Linux apps."
 requires-python = ">=3.11"
 license = "GPL-3.0-or-later"
@@ -18,3 +18,6 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+[tool.setuptools.dynamic]
+version = {attr = "tidylinux.__version__"}

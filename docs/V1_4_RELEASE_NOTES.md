@@ -1,0 +1,15 @@
+# V1.4 development candidate
+
+This prepares version 1.4.0; it is not a public release. Existing local V1.2 and V1.3 work is preserved. No commit, tag, push or publication is performed.
+
+Added Fedora noarch packaging with system Python/GTK/Libadwaita dependencies, a desktop entry, scalable icon, AppStream metadata, deterministic source input, artifact/digest/checksum verification, and isolated container lifecycle tooling. No lifecycle scriptlet touches user storage. Setuptools reads the authoritative Python version; source generation checks the RPM and AppStream versions agree.
+
+The native About dialog uses the actual application ID icon, current version, GPL license, concise description, and verified repository link. Keyboard shortcuts now include manual checks, Cleanup, and close. Existing screens remain intact. The smoke harness exercises the Cleanup scan/selection UI and captures real fixture screenshots; GTK allocation waits keep button-visibility checks meaningful.
+
+README, installation, user, update, cleanup, troubleshooting, architecture, security, contributor and release-checklist documents were added/reworked. CI uses Fedora 45, pinned checkout/artifact actions, read-only repository permissions, offline tests, desktop/AppStream validation, virtual-display smoke, and RPM build/upload. It does not publish GitHub Releases.
+
+The native host is Fedora 45, Python 3.15.2, GTK 4.24.1, Libadwaita 1.10.0. Current automated results: 143 pytest tests and 218 subtests, 143 unittest tests, compilation, shell syntax, Markdown link/image targets and linked heading anchors, desktop entry validation, and AppStream validation pass. AppStream reports optional missing developer information and the historical mixed-case ID as informational/pedantic diagnostics; the stable application ID is preserved.
+
+RPM builds and metadata/payload/dependency/checksum verification pass. In the official Fedora 45 container, DNF install, upgrade from the earlier local development RPM, installed non-root GUI launch, and removal passed. Fixture bundle, rollback, shortcut, source metadata, original archives, and external settings content were unchanged across all three package lifecycle steps. The final documentation/tooling rebuild retains the same application implementation. Development artifacts are unsigned; signature authenticity is not claimed. Source archives are byte-reproducible for identical inputs; RPM reproducibility across toolchains is not claimed. The native GUI smoke passes, including expected Trash-unavailable feedback on the test mount. Captures contain disposable fixture data, not real user applications.
+
+Remaining acceptance includes another Fedora release, actual GNOME Shell search, accessibility and physical input testing, a trusted live GitHub update in disposable storage, native Trash success on a supported mount, and the first hosted GitHub Actions run. Review the [release checklist](V1_4_RELEASE_CHECKLIST.md) before approving publication. Historical release notes remain for context.

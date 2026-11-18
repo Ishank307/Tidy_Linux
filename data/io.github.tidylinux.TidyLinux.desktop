@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=TidyLinux
+Comment=Manage portable applications and installation leftovers
+Exec=tidylinux
+Icon=io.github.tidylinux.TidyLinux
+Terminal=false
+Categories=Utility;
+StartupNotify=true
+Keywords=portable;AppImage;archive;cleanup;

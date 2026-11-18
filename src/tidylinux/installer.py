@@ -211,6 +211,11 @@ class Installer:
             has_backup = backup.exists() or backup.is_symlink()
             if has_backup:
                 validate_version(self.paths, backup, current.app_id)
+            from .sources import SourceStore
+            sources = SourceStore(self.paths)
+            sources.read(current)  # Ownership and schema checks precede removal.
+            source_metadata = sources.path(current)
+            has_source = source_metadata.exists()
             # Invalidate registration atomically before deleting owned files.
             tombstone = Path(tempfile.mkdtemp(prefix="remove-", dir=self.paths.staging))
             try:
@@ -218,15 +223,21 @@ class Installer:
                 try:
                     if has_backup:
                         backup.rename(tombstone / "rollback")
+                    if has_source:
+                        source_metadata.rename(tombstone / "source.json")
                     desktop.unlink(missing_ok=True)
                 except OSError:
                     (tombstone / "bundle").rename(directory)
                     if (tombstone / "rollback").exists():
                         (tombstone / "rollback").rename(backup)
+                    if (tombstone / "source.json").exists():
+                        (tombstone / "source.json").rename(source_metadata)
                     raise
                 shutil.rmtree(tombstone / "bundle")
                 if has_backup:
                     shutil.rmtree(tombstone / "rollback")
+                if has_source:
+                    (tombstone / "source.json").unlink()
             finally:
                 if not any(tombstone.iterdir()):
                     tombstone.rmdir()
